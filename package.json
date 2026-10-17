@@ -1,0 +1,9 @@
+{
+  "name": "sophia-ffproxy",
+  "version": "1.0.0",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "gen": "node gen-manifest.js"
+  }
+}
