@@ -1,11 +1,12 @@
 // language: JavaScript, file: api/ffproxy.js, runtime: Vercel Node 20+
-// Route priority:
-//   1. /ffproxy/<platform>/<version>/fileinfo       → manifest CSV
-//   2. /ffproxy/<platform>/<version>/<bundle>       → bundle bytes
-//   3. /ffproxy/<platform>/<version>/<anything>     → {valid:true,...} JSON (verify, key, license...)
-//   4. /ffproxy  hoặc  /ffproxy?p=<bundle>          → legacy query-style (giữ cho tương thích)
-//   5. /api/* /verify* /license* /key* ...          → {valid:true,...} JSON
-//   6. path khác                                     → SPA fallback
+// Priority:
+//   1. /ffproxy/<platform>/<version>/fileinfo        → manifest CSV
+//   2. /ffproxy/<platform>/<version>/<bundle-path>   → octet-stream bundle
+//   3. /ffproxy/<platform>/<version>/<other>         → JSON fake (verify/key/...)
+//   4. /ffproxy (no path, no query)                  → manifest CSV
+//   5. /ffproxy?p=<bundle-path>                      → octet-stream (legacy)
+//   6. /api/*, /verify*, /license*, /key* …           → JSON fake
+//   7. anything else                                  → SPA fallback HTML
 const fs   = require('fs');
 const path = require('path');
 
@@ -31,7 +32,7 @@ function common(res, vary) {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-credentials', 'true');
   res.setHeader('access-control-allow-methods', 'GET,HEAD,POST,PUT,OPTIONS');
-  res.setHeader('access-control-allow-headers', 'Range,If-None-Match,If-Modified-Since,Content-Type,Authorization,X-Api-Key,X-Key,X-Token');
+  res.setHeader('access-control-allow-headers', 'Range,If-None-Match,If-Modified-Since,Content-Type,Authorization,X-Api-Key,X-Key,X-Token,X-FF-Key,X-FF-HWID');
   res.setHeader('vary', vary || 'Origin');
   for (const k in HELMET) res.setHeader(k, HELMET[k]);
 }
@@ -54,6 +55,34 @@ function serveFile(req, res, filePath, contentType, cacheControl) {
   res.setHeader('etag', tag);
   res.setHeader('accept-ranges', 'bytes');
   if (req.headers['if-none-match'] === tag) { res.status(304).end(); return; }
+
+  const range = req.headers['range'];
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (m) {
+      let s = m[1] === '' ? null : parseInt(m[1], 10);
+      let e = m[2] === '' ? null : parseInt(m[2], 10);
+      if (s === null && e !== null) { s = Math.max(0, stat.size - e); e = stat.size - 1; }
+      else if (s !== null && e === null) { e = stat.size - 1; }
+      if (s === null) s = 0;
+      if (e >= stat.size) e = stat.size - 1;
+      if (s < 0 || s > e) {
+        res.status(416);
+        res.setHeader('content-range', 'bytes */' + stat.size);
+        res.setHeader('content-length', '0');
+        res.end();
+        return;
+      }
+      const len = e - s + 1;
+      res.status(206);
+      res.setHeader('content-range', 'bytes ' + s + '-' + e + '/' + stat.size);
+      res.setHeader('content-length', String(len));
+      if (req.method === 'HEAD') { res.end(); return; }
+      fs.createReadStream(filePath, { start: s, end: e }).pipe(res);
+      return;
+    }
+  }
+
   res.setHeader('content-length', String(stat.size));
   res.status(200);
   if (req.method === 'HEAD') { res.end(); return; }
@@ -63,10 +92,19 @@ function serveFile(req, res, filePath, contentType, cacheControl) {
 function fakeValidation() {
   const now = Math.floor(Date.now() / 1000);
   return {
-    status: 'ok', success: true, valid: true, ok: true,
-    authorized: true, activated: true, active: true,
-    license: 'active', tier: 'premium', plan: 'lifetime',
-    message: 'activated', code: 0, code_msg: 'success',
+    status: 'ok',
+    success: true,
+    valid: true,
+    ok: true,
+    authorized: true,
+    activated: true,
+    active: true,
+    license: 'active',
+    tier: 'premium',
+    plan: 'lifetime',
+    message: 'activated',
+    code: 0,
+    code_msg: 'success',
     key: 'PREMIUM-ACTIVE',
     token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJwcmVtaXVtIiwidmFsaWQiOnRydWUsImV4cCI6OTk5OTk5OTk5OX0.fake',
     expires_at: now + 31536000,
@@ -75,7 +113,7 @@ function fakeValidation() {
     user: { id: 1, username: 'premium', role: 'admin', tier: 'premium' },
     data: { valid: true, activated: true, tier: 'premium', active: true },
     result: { valid: true, ok: true, status: 'active' },
-    features: ['esp','aim','speed','wallhack','fly','infinite_ammo','no_recoil','anti_ban'],
+    features: ['esp', 'aim', 'speed', 'wallhack', 'fly', 'infinite_ammo', 'no_recoil', 'anti_ban'],
   };
 }
 
@@ -83,11 +121,11 @@ function sendJson(res, obj) {
   const body = JSON.stringify(obj);
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.setHeader('cache-control', 'no-store, max-age=0, must-revalidate');
+  res.setHeader('etag', 'W/"' + body.length.toString(16) + '-0"');
   res.setHeader('content-length', String(Buffer.byteLength(body)));
   res.status(200).end(body);
 }
 
-// Thử resolve bundle path trong data/files/
 function tryBundle(resource) {
   const clean = String(resource).replace(/^\/+/, '');
   if (!clean || clean.includes('..') || clean.includes('\0')) return null;
@@ -124,23 +162,21 @@ module.exports = async function handler(req, res) {
 
   const url = new URL(req.url, 'http://x');
   const pathname = url.pathname;
+  if (process.env.DEBUG === '1') console.log('[REQ]', req.method, pathname, req.headers['user-agent']);
 
-  // ============ 1-3. /ffproxy/<platform>/<version>/<resource> ============
+  // ========== 1-3. /ffproxy/<platform>/<version>/<...> ==========
   const pathMatch = pathname.match(/^\/ffproxy\/([^/]+)\/([^/]+)(?:\/(.+))?$/);
   if (pathMatch) {
-    const platform = pathMatch[1];
-    const version  = pathMatch[2];
     const resource = pathMatch[3] || '';
+    const isFileInfo = resource === 'fileinfo' || resource.endsWith('/fileinfo');
 
-    // 1a. fileinfo → manifest CSV
-    if (resource === 'fileinfo') {
+    if (isFileInfo) {
       common(res, 'Origin');
       if (!fs.existsSync(MANIFEST)) { notFound(res); return; }
       serveFile(req, res, MANIFEST, 'text/plain; charset=utf-8', 'no-store, no-cache, must-revalidate');
       return;
     }
 
-    // 1b. bundle file
     if (resource) {
       const local = tryBundle(resource);
       if (local) {
@@ -150,13 +186,12 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // 1c. mọi thứ khác dưới /ffproxy/<x>/<y>/... → giả JSON (verify, key, activate...)
     common(res, 'Origin');
     sendJson(res, fakeValidation());
     return;
   }
 
-  // ============ 4. /ffproxy legacy query-style ============
+  // ========== 4-5. /ffproxy (query style) ==========
   if (pathname === '/ffproxy' || pathname === '/ffproxy/') {
     common(res, 'Origin');
     const p = url.searchParams.get('p');
@@ -172,14 +207,14 @@ module.exports = async function handler(req, res) {
     return;
   }
 
-  // ============ 5. API validate fake ============
+  // ========== 6. /api/ff-menu/verify & friends ==========
   if (isApiPath(pathname)) {
     common(res, 'Origin');
     sendJson(res, fakeValidation());
     return;
   }
 
-  // ============ 6. SPA fallback ============
+  // ========== 7. SPA fallback ==========
   common(res, 'Origin, accept-encoding');
   if (!fs.existsSync(SPA)) {
     const minimal = '<!doctype html><html><head><meta charset="UTF-8"/></head><body></body></html>';
