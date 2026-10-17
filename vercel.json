@@ -1,0 +1,11 @@
+{
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/ffproxy" }
+  ],
+  "functions": {
+    "api/ffproxy.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  }
+}
