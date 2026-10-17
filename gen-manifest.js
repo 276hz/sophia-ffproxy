@@ -1,5 +1,4 @@
 // language: JavaScript, file: gen-manifest.js, runtime: Node 18+
-// Sinh data/manifest.csv từ data/files/. File trong files/ là gzip.
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
